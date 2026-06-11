@@ -24,6 +24,8 @@ description: "跨软件版本移植补丁文件，通过理解语义意图而非
 
 **按顺序**处理补丁（0001、0002……）。后续补丁可能依赖前序补丁。对于每个补丁：
 
+> **效率提示**：大型补丁（15+ 文件，50+ 变更点）不需要逐一规划每个 hunk。采用"编译驱动"策略：先做核心逻辑变更 → 编译 → 根据错误列表迭代修复。详见第 5 步。
+
 ### 第 1 步：分析（ANALYZE）—— 将补丁分解为原子意图
 
 阅读整个补丁文件。对于每个 hunk（差异段），识别：
@@ -58,6 +60,18 @@ description: "跨软件版本移植补丁文件，通过理解语义意图而非
 - 补丁假定存在但目标中缺失的字段或方法
 - 如果文件不存在，搜索重命名或等价的文件
 
+**关键：建立 API 映射表**。同一个概念在不同版本可能使用不同的 API。在侦察阶段主动发现这些差异：
+
+| 类别 | 示例差异 |
+|------|----------|
+| 函数名 | `CreateFromString()` vs `ParseSliceTransform()` |
+| 方法名 | `AsString()` vs `Name()` vs 直接 `.compare()` |
+| 类型名 | `ImmutableOptions` vs `ImmutableCFOptions` |
+| 比较方式 | `!=` operator vs `.compare() != 0` vs `AsString() !=` |
+| 指针风格 | `const T*` vs `shared_ptr<T>` vs `unique_ptr<T>` |
+
+**方法**：对于补丁中涉及的每个关键函数调用，在目标版本中 `grep` 相同模块的符号。例如补丁调用 `SliceTransform::CreateFromString()`，则在目标中搜索 `SliceTransform::` 相关的创建方法。
+
 记录你的发现——这就是你的适配映射。
 
 ### 第 3 步：评估（ASSESS）—— 对每个 hunk 分类
@@ -87,6 +101,21 @@ description: "跨软件版本移植补丁文件，通过理解语义意图而非
 
 复杂补丁的分解策略见 `references/patch-anatomy.md`。
 
+#### 处理大规模机械变更
+
+当补丁在同一模式上修改 10+ 个文件时（如类型迁移、签名变更），逐文件 Edit 效率极低。策略：
+
+1. **优先 `sed` 批量处理**。机械模式（如 `const SliceTransform* → const std::shared_ptr<const SliceTransform>&`）用 `sed -i 's/old/new/g' file1 file2 ...` 一次性完成。这是安全的——如果改错了，编译器会告诉你。
+
+2. **区分"传参链"和"用户面 API"**。类型迁移只需改内部传参链上的函数签名，**不要改用户面 API**。例如 `TableReader::NewIterator()` 仍接受裸指针，但 `TableCache::NewIterator()` 改为接受 `shared_ptr`。
+
+3. **`replace_all: true`**。当一个文件中出现多处相同模式时，用 Edit 工具的 `replace_all: true` 一次性替换。
+
+4. **编译后迭代修复**。批量替换后必然有编译错误。按错误信息分两类处理：
+   - "cannot convert shared_ptr to raw pointer" → 这处需要 `.get()`
+   - "cannot convert raw pointer to shared_ptr" → 这处需要去掉 `.get()`
+   再用 `sed` 批量处理每一类。
+
 ### 第 5 步：验证（VERIFY）—— 编译并修复
 
 移植每个补丁后，编译目标项目。使用 `local_build.sh` 中的构建命令或用户的指令。
@@ -98,6 +127,60 @@ description: "跨软件版本移植补丁文件，通过理解语义意图而非
   - 缺少字段/方法 → 可能需要先添加基础设施
 - 在目标文件中修复错误，重新编译，重复直到干净。
 - 当前补丁编译通过之前，**不要**继续下一个补丁。
+
+**编译驱动策略**（适用于大型补丁）：不要试图一次性完美移植所有变更。更高效的流程是：
+
+```
+核心变更（头文件 + 实现）→ 编译 → 根据错误列表迭代修复 → 编译通过
+```
+
+每次编译后，按错误信息分类：
+1. **"cannot convert X to Y"** → 批量 `sed` 修复调用点的 `.get()` 添加/移除
+2. **"no matching function for call"** → 函数签名遗漏，编辑声明
+3. **"no declaration matches"** → header/cc 签名不一致，对齐
+4. **"defined but not used"** → 旧函数已无调用者，删除或标记 `inline`
+
+每一轮编译-修复循环后，错误数应显著减少。以 0 errors 为完成标志。
+
+**构建命令发现**：如果用户在目标目录中没有提供构建命令：
+- 优先查找 `local_build.sh`
+- 否则查找 `Makefile`，使用 `make static_lib -j$(nproc)` 编译静态库
+- 如果链接失败（如 `typeinfo` 未定义），先尝试 `make clean && make ...`
+- 验证 db_bench 工具可构建：`make db_bench -j$(nproc)`（用于后续性能测试）
+
+### 第 5.5 步：性能验证（可选的基准测试）
+
+如果补丁声称是性能优化，或者涉及热路径变更，应在提交前进行性能对比验证。
+
+**使用 Git Worktree 进行基线对比**：
+
+```bash
+# 1. 创建基线 worktree（基于移植前的 commit）
+git worktree add /tmp/<project>_baseline <baseline_commit>
+
+# 2. 在 worktree 中编译 db_bench
+make -C /tmp/<project>_baseline clean && make -C /tmp/<project>_baseline -j$(nproc) db_bench
+
+# 3. 用基线和新代码分别填充 DB 并运行 seekrandom
+# 基线：
+/tmp/<project>_baseline/db_bench --db=/tmp/bench_base --benchmarks=fillrandom ...
+/tmp/<project>_baseline/db_bench --db=/tmp/bench_base --benchmarks=seekrandom ... | grep seekrandom
+
+# 新代码：
+./db_bench --db=/tmp/bench_new --benchmarks=fillrandom ...
+./db_bench --db=/tmp/bench_new --benchmarks=seekrandom ... | grep seekrandom
+
+# 4. 清理
+git worktree remove /tmp/<project>_baseline
+```
+
+**基准测试要点**：
+- 跑 3 次取平均值，消除噪音
+- 使用 `--use_existing_keys=true` 确保只读存在的 key
+- 记录每次移植后的性能变化（+X%或-Y%）
+- 性能测试结果应写入移植报告的"性能影响"部分
+
+**测试完成后清理 worktree**：`git worktree remove <path>`
 
 ### 第 6 步：提交（COMMIT）—— 为每个补丁创建 git commit
 
@@ -240,3 +323,43 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 - `references/assessment-guide.md` — 每个评估类别的详细示例
 - `references/type-migration.md` — 指针类型迁移的决策框架
 - `references/patch-anatomy.md` — 如何阅读和分解复杂补丁
+
+## 实战经验教训
+
+以下是从 rocksdb v6.26.1 和 frocksdb 6.20.3 两次完整移植中总结的关键教训：
+
+### 1. 补丁间依赖必须显式文档化
+
+PR #9407（prefix_extractor 快路径）依赖 PR #8692（MetaBlockIter 重构）对 `block_based_table_reader.cc` 的变更。如果在分析阶段就识别并记录这种依赖，后续移植时可以避免上下文混淆。
+
+**做法**：在第 1 步分析时，检查补丁是否修改了前序补丁已变更的文件。如果是，记录依赖关系。
+
+### 2. 安全凭证不要出现在命令行
+
+`echo "token" | gh auth login` 会将 token 暴露在 shell 历史、进程列表和对话记录中。一旦泄露，自动模式安全策略会持续阻止后续 Bash 命令。
+
+**做法**：始终通过 `gh auth login` 交互式认证，或通过 `GITHUB_TOKEN` 环境变量（从文件读取，不 echo）。
+
+### 3. 目标版本 API 差异是最大的陷阱
+
+frocksdb 6.20.3 使用 `prefix_extractor->Name()` 而非 `AsString()`、`ParseSliceTransform()` 而非 `SliceTransform::CreateFromString()`。这些 API 差异在编译阶段才暴露，但如果在侦察阶段主动 grep 目标的关键符号，可以提前发现。
+
+**做法**：在第 2 步侦察时，对补丁中每个关键函数调用，在目标中搜索同名符号。如果不存在，搜索模块内的类似方法名。
+
+### 4. 编译-修复循环比完美规划更高效
+
+第一次移植 PR #9407 时尝试逐文件规划所有变更，耗时巨大且容易遗漏。第二次采用"先做核心变更→编译→按错误列表修复"策略，效率显著提升。
+
+**做法**：对于 10+ 文件的补丁，不要试图一次性完美移植。先移植核心逻辑（头文件 + 核心实现），编译，让编译器告诉你还需要改什么。
+
+### 5. `sed` 批量处理机械变更是正确的
+
+类型迁移（`const T*` → `shared_ptr<T>`）涉及 50+ 个调用点的 `.get()` 添加/移除。用 `sed` 批量处理 + 编译验证循环，比逐文件 Edit 快 10 倍。关键是利用编译器作为安全网——sed 改错了编译器会告诉你。
+
+**做法**：识别出"纯机械"的变更模式后，用 `sed` 批量处理，然后编译验证。重复直到 0 errors。
+
+### 6. 性能收益与基线版本密切相关
+
+PR #9407 在 rocksdb v6.26.1 上收益 +29.4%（因为 6.26 引入了 `AsString()` 性能回退），但在 frocksdb 6.20.3 上仅 +2.7%（6.20.3 没有这个回退）。这说明对于性能优化补丁，需要理解优化的前提条件在目标版本中是否存在。
+
+**做法**：在第 1 步分析时，识别补丁修复的"问题"在目标版本中是否存在。如果目标版本没有这个问题，性能优化的收益会很小，但移植仍然有价值（为后续版本升级保留快路径）。
